@@ -7,16 +7,32 @@ import (
 	"fmt"
 	"github.com/go-sql-driver/mysql"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const fbAccessToken = "EAAP2ZBKHoPa4BABvLZBQC28gOMDSZAcYu0tARGrkmtZCliZCDgLQVmMlNn5it8TCPmLlv3DQlsEV8CQrSfhv68FxG1RLIZCSrUdbB5ncf7vxUwRVXhRuxOiQOvhHSe9ZCKOWpDlf2qyu4dLMGhuhakzYHpFek2VxZBl6X8kWt7IalqJ8ZCBUn8EZClrqvcI4XOwEli233UcH6UEwZDZD"
+var config configuration
+
+type configuration struct {
+	FacebookAccessToken     string `json:"facebook_access_token"`
+	FacebookConversionToken string `json:"facebook_conversion_token"`
+	FacebookPixelId         string `json:"facebook_pixel_id"`
+	Location                string `json:"location"`
+	OfflineEventSetId       string `json:"offline_event_set_id"`
+	DatabaseUser            string `json:"database_user"`
+	DatabasePassword        string `json:"database_password"`
+	DatabaseAddress         string `json:"database_address"`
+	DatabaseName            string `json:"database_name"`
+	DaysAgo                 int    `json:"days_ago"`
+}
 
 type matchKeys struct {
 	Phone    []string `json:"phone"`
@@ -40,20 +56,75 @@ type purchase struct {
 	EventTime int64     `json:"event_time"`
 }
 
-func main() {
-	daysAgo := 22
-	// Step 1, fetch purchases from RGP
-	purchases := fetchPurchases(daysAgo)
-
-	// Step 2, hash data and prepare for upload to Facebook
-	hashedPurchases := hashPurchases(purchases)
-
-	// Step 3, upload the purchases to Facebook
-	uploadPurchases(hashedPurchases, daysAgo)
+type conversionUserData struct {
+	Email      []string `json:"em"`
+	Phone      []string `json:"ph"`
+	FirstName  string   `json:"fn"`
+	LastName   string   `json:"ln"`
+	Birthday   string   `json:"db"`
+	Zipcode    string   `json:"zp"`
+	Country    string   `json:"country"`
+	ExternalId string   `json:"external_id"`
 }
 
-func uploadPurchases(purchases []purchase, daysAgo int) {
-	dayOfData := time.Now().AddDate(0, 0, -daysAgo)
+type conversionCustomData struct {
+	Currency string  `json:"currency"`
+	Value    float32 `json:"value"`
+}
+
+type conversion struct {
+	EventName    string               `json:"event_name"`
+	EventTime    int64                `json:"event_time"`
+	ActionSource string               `json:"action_source"`
+	UserData     conversionUserData   `json:"user_data"`
+	CustomData   conversionCustomData `json:"custom_data"`
+}
+
+func main() {
+	loadConfig()
+
+	ReportOfflinePurchasesToFacebook()
+	ReportOnlinePurchasesToFacebook()
+}
+
+func ReportOfflinePurchasesToFacebook() {
+	offlinePurchases := fetchPurchases("POS")
+	hashedOfflinePurchases := hashOfflineFacebookPurchases(offlinePurchases)
+	uploadOfflinePurchasesToFacebook(hashedOfflinePurchases)
+}
+
+func ReportOnlinePurchasesToFacebook() {
+	onlinePurchase := fetchPurchases("ONLINE")
+	hashedOnlinePurchases := hashOnlineFacebookPurchases(onlinePurchase)
+	uploadOnlinePurchasesToFacebook(hashedOnlinePurchases)
+}
+
+func loadConfig() {
+	ex, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+
+	jsonFile, err := os.Open(filepath.Join(filepath.Dir(ex), "config.txt"))
+
+	if err != nil {
+		panic(err)
+	}
+
+	byteValue, err := ioutil.ReadAll(jsonFile)
+
+	if err != nil {
+		panic(err)
+	}
+
+	err = json.Unmarshal(byteValue, &config)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func uploadOfflinePurchasesToFacebook(purchases []purchase) {
+	dayOfData := time.Now().AddDate(0, 0, -config.DaysAgo)
 	dayOfData = time.Date(dayOfData.Year(), dayOfData.Month(), dayOfData.Day(), 0, 0, 0, 0, time.Local)
 
 	jsonPurchases, err := json.Marshal(purchases)
@@ -63,12 +134,12 @@ func uploadPurchases(purchases []purchase, daysAgo int) {
 	}
 
 	data := url.Values{
-		"access_token": {fbAccessToken},
-		"upload_tag":   {"rgp_upload_" + "vgn" + "_" + dayOfData.Format("2006-01-02")},
+		"access_token": {config.FacebookAccessToken},
+		"upload_tag":   {"rgp_upload_" + config.Location + "_" + dayOfData.Format("2006-01-02")},
 		"data":         {string(jsonPurchases)},
 	}
 
-	resp, err := http.PostForm("https://graph.facebook.com/v12.0/323247912682990/events", data)
+	resp, err := http.PostForm("https://graph.facebook.com/v12.0/"+config.OfflineEventSetId+"/events", data)
 
 	if err != nil {
 		log.Fatal(err)
@@ -78,7 +149,28 @@ func uploadPurchases(purchases []purchase, daysAgo int) {
 	fmt.Println(string(body))
 }
 
-func hashPurchases(purchases *sql.Rows) (hashedPurchases []purchase) {
+func uploadOnlinePurchasesToFacebook(conversions []conversion) {
+	jsonConversions, err := json.Marshal(conversions)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	data := url.Values{
+		"data": {string(jsonConversions)},
+	}
+
+	resp, err := http.PostForm("https://graph.facebook.com/v12.0/"+config.FacebookPixelId+"/events?access_token="+config.FacebookConversionToken, data)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Println(string(body))
+}
+
+func hashOfflineFacebookPurchases(purchases *sql.Rows) (hashedPurchases []purchase) {
 	var (
 		email      string
 		cellPhone  string
@@ -126,6 +218,53 @@ func hashPurchases(purchases *sql.Rows) (hashedPurchases []purchase) {
 	return hashedPurchases
 }
 
+func hashOnlineFacebookPurchases(purchases *sql.Rows) (conversionEvents []conversion) {
+	var (
+		email      string
+		cellPhone  string
+		homePhone  string
+		firstName  string
+		lastName   string
+		zip        string
+		birthday   time.Time
+		customerId int
+		amount     float32
+		invoiceId  int
+		postdate   time.Time
+	)
+
+	columns := []interface{}{&email, &cellPhone, &homePhone, &firstName, &lastName, &zip, &birthday, &customerId, &amount, &invoiceId, &postdate}
+
+	for purchases.Next() {
+		if err := purchases.Scan(columns...); err != nil {
+			panic(err)
+		}
+
+		conversionEvent := conversion{
+			EventName:    "Purchase",
+			EventTime:    postdate.Unix(),
+			ActionSource: "website",
+			UserData: conversionUserData{
+				Email:      formatEmail(email),
+				Phone:      formatPhoneNumbers(homePhone, cellPhone),
+				FirstName:  hexDigest(strings.ToLower(strings.TrimSpace(firstName))),
+				LastName:   hexDigest(strings.ToLower(strings.TrimSpace(lastName))),
+				Birthday:   hexDigest(birthday.Format("2006-02-01")),
+				Zipcode:    hexDigest(strings.ToLower(strings.ReplaceAll(zip, " ", ""))),
+				ExternalId: strconv.Itoa(customerId),
+			},
+			CustomData: conversionCustomData{
+				Currency: "CAD",
+				Value:    amount,
+			},
+		}
+
+		conversionEvents = append(conversionEvents, conversionEvent)
+	}
+
+	return conversionEvents
+}
+
 func formatEmail(email string) []string {
 	if len(email) == 0 {
 		return []string{}
@@ -134,9 +273,9 @@ func formatEmail(email string) []string {
 	return []string{hexDigest(strings.ToLower(strings.TrimSpace(email)))}
 }
 
-func fetchPurchases(daysAgo int) *sql.Rows {
+func fetchPurchases(purchaseType string) *sql.Rows {
 	db := connectToRgp()
-	query := buildQuery(daysAgo)
+	query := buildQuery(purchaseType)
 
 	results, err := db.Query(query)
 
@@ -159,8 +298,6 @@ func formatPhoneNumbers(homePhone string, cellPhone string) (numbers []string) {
 	return numbers
 }
 
-// Phone numbers can't have any punctuation and must have a leading 1.
-// For example "(226) 600-1303" should be "12266001303"
 func formatPhoneNumber(number string) string {
 	nonNumber := regexp.MustCompile("[^0-9]")
 
@@ -172,8 +309,8 @@ func formatPhoneNumber(number string) string {
 	return hexDigest(number)
 }
 
-func buildQuery(daysAgo int) string {
-	startOfDay := time.Now().AddDate(0, 0, -daysAgo)
+func buildQuery(purchaseType string) string {
+	startOfDay := time.Now().AddDate(0, 0, -config.DaysAgo)
 	startOfDay = time.Date(startOfDay.Year(), startOfDay.Month(), startOfDay.Day(), 0, 0, 0, 0, time.Local)
 	endOfDay := startOfDay.AddDate(0, 0, 1)
 
@@ -194,17 +331,17 @@ func buildQuery(daysAgo int) string {
 	where invoices.voidedinvoice = 0
 	and invoices.customer_id != 1008
 	and amount > 0
-	and invoices.invtype = 'POS'
+	and invoices.invtype = '` + purchaseType + `'
 	and invoices.postdate between '` + startOfDay.Format(time.RFC3339) + "' and '" + endOfDay.Format(time.RFC3339) + "'"
 }
 
 func connectToRgp() *sql.DB {
 	var dbConfig mysql.Config
-	dbConfig.User = "readonly"
-	dbConfig.Passwd = "IDOdL52bEs6SrtQ8Xpg1h56jZjIayt4I"
+	dbConfig.User = config.DatabaseUser
+	dbConfig.Passwd = config.DatabasePassword
 	dbConfig.Net = "tcp"
-	dbConfig.Addr = "184.148.49.176"
-	dbConfig.DBName = "aspireclimbingvaughan"
+	dbConfig.Addr = config.DatabaseAddress
+	dbConfig.DBName = config.DatabaseName
 	dbConfig.ParseTime = true
 	dbConfig.AllowNativePasswords = true
 
