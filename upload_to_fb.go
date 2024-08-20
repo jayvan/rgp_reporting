@@ -22,16 +22,14 @@ import (
 var config configuration
 
 type configuration struct {
-	FacebookAccessToken     string `json:"facebook_access_token"`
 	FacebookConversionToken string `json:"facebook_conversion_token"`
 	FacebookPixelId         string `json:"facebook_pixel_id"`
-	Location                string `json:"location"`
-	OfflineEventSetId       string `json:"offline_event_set_id"`
 	DatabaseUser            string `json:"database_user"`
 	DatabasePassword        string `json:"database_password"`
 	DatabaseAddress         string `json:"database_address"`
 	DatabaseName            string `json:"database_name"`
 	DaysAgo                 int    `json:"days_ago"`
+	Currency                string `json:"currency"`
 }
 
 type matchKeys struct {
@@ -82,21 +80,9 @@ type conversion struct {
 
 func main() {
 	loadConfig()
-
-	ReportOfflinePurchasesToFacebook()
-	ReportOnlinePurchasesToFacebook()
-}
-
-func ReportOfflinePurchasesToFacebook() {
-	offlinePurchases := fetchPurchases("POS")
-	hashedOfflinePurchases := hashOfflineFacebookPurchases(offlinePurchases)
-	uploadOfflinePurchasesToFacebook(hashedOfflinePurchases)
-}
-
-func ReportOnlinePurchasesToFacebook() {
-	onlinePurchase := fetchPurchases("ONLINE")
-	hashedOnlinePurchases := hashOnlineFacebookPurchases(onlinePurchase)
-	uploadOnlinePurchasesToFacebook(hashedOnlinePurchases)
+	purchases := fetchPurchases()
+	hashedPurchases := hashOnlineFacebookPurchases(purchases)
+	uploadOnlinePurchasesToFacebook(hashedPurchases)
 }
 
 func loadConfig() {
@@ -123,32 +109,6 @@ func loadConfig() {
 	}
 }
 
-func uploadOfflinePurchasesToFacebook(purchases []purchase) {
-	dayOfData := time.Now().AddDate(0, 0, -config.DaysAgo)
-	dayOfData = time.Date(dayOfData.Year(), dayOfData.Month(), dayOfData.Day(), 0, 0, 0, 0, time.Local)
-
-	jsonPurchases, err := json.Marshal(purchases)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	data := url.Values{
-		"access_token": {config.FacebookAccessToken},
-		"upload_tag":   {"rgp_upload_" + config.Location + "_" + dayOfData.Format("2006-01-02")},
-		"data":         {string(jsonPurchases)},
-	}
-
-	resp, err := http.PostForm("https://graph.facebook.com/v12.0/"+config.OfflineEventSetId+"/events", data)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Println(string(body))
-}
-
 func uploadOnlinePurchasesToFacebook(conversions []conversion) {
 	jsonConversions, err := json.Marshal(conversions)
 
@@ -168,54 +128,6 @@ func uploadOnlinePurchasesToFacebook(conversions []conversion) {
 
 	body, _ := io.ReadAll(resp.Body)
 	fmt.Println(string(body))
-}
-
-func hashOfflineFacebookPurchases(purchases *sql.Rows) (hashedPurchases []purchase) {
-	var (
-		email      string
-		cellPhone  string
-		homePhone  string
-		firstName  string
-		lastName   string
-		zip        string
-		birthday   time.Time
-		customerId int
-		amount     float32
-		invoiceId  int
-		postdate   time.Time
-	)
-
-	columns := []interface{}{&email, &cellPhone, &homePhone, &firstName, &lastName, &zip, &birthday, &customerId, &amount, &invoiceId, &postdate}
-
-	for purchases.Next() {
-		if err := purchases.Scan(columns...); err != nil {
-			panic(err)
-		}
-
-		hashedPurchase := purchase{
-			MatchKeys: matchKeys{
-				Phone:    formatPhoneNumbers(homePhone, cellPhone),
-				Email:    formatEmail(email),
-				Fn:       hexDigest(strings.ToLower(strings.TrimSpace(firstName))),
-				Ln:       hexDigest(strings.ToLower(strings.TrimSpace(lastName))),
-				Country:  hexDigest("ca"),
-				ExternId: customerId,
-				DobY:     hexDigest(strconv.Itoa(birthday.Year())),
-				DobM:     hexDigest(birthday.Format("01")),
-				DobD:     hexDigest(birthday.Format("02")),
-				Zip:      hexDigest(strings.ToLower(strings.ReplaceAll(zip, " ", ""))),
-			},
-			Currency:  "CAD",
-			Value:     amount,
-			EventName: "Purchase",
-			OrderId:   invoiceId,
-			EventTime: postdate.Unix(),
-		}
-
-		hashedPurchases = append(hashedPurchases, hashedPurchase)
-	}
-
-	return hashedPurchases
 }
 
 func hashOnlineFacebookPurchases(purchases *sql.Rows) (conversionEvents []conversion) {
@@ -246,7 +158,7 @@ func hashOnlineFacebookPurchases(purchases *sql.Rows) (conversionEvents []conver
 			ActionSource: "website",
 			UserData: conversionUserData{
 				Email:      formatEmail(email),
-				Phone:      formatPhoneNumbers(homePhone, cellPhone),
+				Phone:      formatPhoneNumbers(homePhone, cellPhone, false),
 				FirstName:  hexDigest(strings.ToLower(strings.TrimSpace(firstName))),
 				LastName:   hexDigest(strings.ToLower(strings.TrimSpace(lastName))),
 				Birthday:   hexDigest(birthday.Format("2006-02-01")),
@@ -254,7 +166,7 @@ func hashOnlineFacebookPurchases(purchases *sql.Rows) (conversionEvents []conver
 				ExternalId: strconv.Itoa(customerId),
 			},
 			CustomData: conversionCustomData{
-				Currency: "CAD",
+				Currency: config.Currency,
 				Value:    amount,
 			},
 		}
@@ -273,9 +185,9 @@ func formatEmail(email string) []string {
 	return []string{hexDigest(strings.ToLower(strings.TrimSpace(email)))}
 }
 
-func fetchPurchases(purchaseType string) *sql.Rows {
+func fetchPurchases() *sql.Rows {
 	db := connectToRgp()
-	query := buildQuery(purchaseType)
+	query := buildQuery()
 
 	results, err := db.Query(query)
 
@@ -286,19 +198,19 @@ func fetchPurchases(purchaseType string) *sql.Rows {
 	return results
 }
 
-func formatPhoneNumbers(homePhone string, cellPhone string) (numbers []string) {
+func formatPhoneNumbers(homePhone string, cellPhone string, leadingPlus bool) (numbers []string) {
 	if len(homePhone) > 0 {
-		numbers = append(numbers, formatPhoneNumber(homePhone))
+		numbers = append(numbers, formatPhoneNumber(homePhone, leadingPlus))
 	}
 
 	if len(cellPhone) > 0 {
-		numbers = append(numbers, formatPhoneNumber(cellPhone))
+		numbers = append(numbers, formatPhoneNumber(cellPhone, leadingPlus))
 	}
 
 	return numbers
 }
 
-func formatPhoneNumber(number string) string {
+func formatPhoneNumber(number string, leadingPlus bool) string {
 	nonNumber := regexp.MustCompile("[^0-9]")
 
 	number = nonNumber.ReplaceAllString(number, "")
@@ -306,10 +218,14 @@ func formatPhoneNumber(number string) string {
 		number = "1" + number
 	}
 
+	if len(number) == 11 && leadingPlus {
+		number = "+" + number
+	}
+
 	return hexDigest(number)
 }
 
-func buildQuery(purchaseType string) string {
+func buildQuery() string {
 	startOfDay := time.Now().AddDate(0, 0, -config.DaysAgo)
 	startOfDay = time.Date(startOfDay.Year(), startOfDay.Month(), startOfDay.Day(), 0, 0, 0, 0, time.Local)
 	endOfDay := startOfDay.AddDate(0, 0, 1)
@@ -331,7 +247,6 @@ func buildQuery(purchaseType string) string {
 	where invoices.voidedinvoice = 0
 	and invoices.customer_id != 1008
 	and amount > 0
-	and invoices.invtype = '` + purchaseType + `'
 	and invoices.postdate between '` + startOfDay.Format(time.RFC3339) + "' and '" + endOfDay.Format(time.RFC3339) + "'"
 }
 
